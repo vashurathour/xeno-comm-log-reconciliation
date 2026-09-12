@@ -1,159 +1,173 @@
 # Communication Log Reconciliation
 
-SQL-based reconciliation of communication logs to determine the correct Finance `target_base` for a merchant's Diwali campaigns.
+SQL-based reconciliation of campaign communication logs to determine the Finance-reported `target_base` for Merchant 501's Diwali campaigns.
 
 ## Overview
 
-This project investigates a discrepancy between a naive communication count and the `target_base` reported by Finance.
+This project analyzes communication and campaign data to reconcile a discrepancy between the raw communication count and Finance's reported target base.
 
-For Merchant `501` and the relevant October 2026 Diwali campaigns:
+The initial analysis produced a count of **25**, while the Finance target was **22**.
 
-* Initial count: **25**
-* Finance target: **22**
-* Final reconciled count: **22**
+The objective was to identify the underlying business rules and implement a reproducible SQL solution that correctly handles campaign eligibility, retries, and repeated customer communications.
 
-The analysis identifies the business rules responsible for the difference and implements them in SQL.
+**Final reconciled target base: `22`**
 
-## Business Problem
+---
 
-Communication logs contain multiple campaign types, campaign retries, delivery statuses, and campaign approval states.
+## Problem
 
-A simple customer-level distinct count is insufficient because:
+A simple count of communication records or distinct customers does not correctly represent the business definition of a communication event.
 
-* Unapproved campaigns should not contribute to the Finance count.
-* Retry campaigns represent the same underlying communication and should be deduplicated.
-* Multiple sends from a standalone campaign can represent legitimate separate communication events.
+The dataset contains:
 
-The objective is therefore to build a reproducible SQL reconciliation rather than simply match the expected number.
+* Campaign lifecycle states
+* Processed and delivered communication logs
+* Retry campaigns linked through `parent_id`
+* Multiple communications to the same customer
+* Campaigns that should be excluded from reporting
 
-## Objective
+The reconciliation therefore requires distinguishing between:
 
-Determine the correct Finance `target_base` by:
+* Invalid/ineligible campaigns
+* Retry communications
+* Legitimate repeated sends
 
-1. Filtering to the relevant merchant and campaign period.
-2. Applying campaign approval/finalization rules.
-3. Selecting qualifying delivered communications.
-4. Resolving campaign retry lineage using `parent_id`.
-5. Deduplicating customers within retry chains.
-6. Preserving legitimate repeated sends from standalone campaigns.
-7. Reconciling the result to Finance's reported `target_base`.
+---
 
-## Key Result
+## Solution
 
-| Metric                                     |  Count |
-| ------------------------------------------ | -----: |
-| Initial naive count                        |     25 |
-| Excluded due to campaign approval status   |      4 |
-| Post-filter count                          |     21 |
-| Legitimate standalone repeat send restored |      1 |
-| **Final Finance target_base**              | **22** |
+The reconciliation is implemented using SQL and follows four main stages:
 
-## Business Rules
+### 1. Campaign eligibility
 
-### Campaign eligibility
+Filter campaigns using the required merchant, campaign, processing, and lifecycle-status criteria.
 
-Only campaigns satisfying the required merchant, campaign, processing, and finalized creation-status criteria are included.
+Campaigns that have not reached the required finalized state are excluded from the reporting population.
 
-Campaign `9004` is excluded because it remained in an approval-pending state.
+### 2. Communication filtering
 
-### Retry handling
+Select qualifying communication records based on:
 
-Campaigns can reference previous campaigns through `parent_id`.
-
-A recursive CTE is used to identify the root campaign and group retry chains into a single logical communication lineage.
-
-Within a retry chain:
-
-```text
-Same customer + same communication lineage
-→ Count once
-```
-
-### Standalone campaign handling
-
-Standalone campaigns (`parent_id IS NULL`) are treated differently.
-
-Multiple delivered sends to the same customer can represent separate communication events:
-
-```text
-Standalone campaign
-C20 → Send 1
-C20 → Send 2
-
-→ Count = 2
-```
-
-This prevents over-deduplication.
-
-## Technical Approach
-
-The SQL implementation uses Common Table Expressions (CTEs) to separate business logic into clear stages.
-
-### 1. Campaign filtering
-
-Identify eligible campaigns based on merchant, campaign, processing, and creation status.
-
-### 2. Campaign lineage
-
-A recursive CTE follows `parent_id` relationships to determine the root campaign for retry chains.
-
-### 3. Qualifying communications
-
-Filter communication logs using the required:
-
-* Merchant
+* Reporting period
 * Communication type
 * Delivery status
-* Reporting period
+* Eligible campaigns
+
+### 3. Campaign lineage
+
+Use a **recursive CTE** to traverse `parent_id` relationships and identify the root campaign of retry chains.
+
+This allows multiple retry campaigns to be treated as one underlying communication lineage.
 
 ### 4. Context-aware aggregation
 
-The final aggregation applies different counting rules depending on whether the communication belongs to a retry chain or a standalone campaign.
+Apply different counting logic based on campaign lineage:
 
-Conceptually:
+| Scenario            | Counting logic                       |
+| ------------------- | ------------------------------------ |
+| Retry chain         | `COUNT(DISTINCT customer_id)`        |
+| Standalone campaign | Count each qualifying delivered send |
 
-```sql
-CASE
-    WHEN campaign_lineage_contains_retries
-        THEN COUNT(DISTINCT customer_id)
-    ELSE
-        COUNT(*)
-END
-```
+This prevents both over-counting retries and under-counting legitimate repeated communications.
 
-This produces the final:
+---
+
+## Technical Approach
 
 ```text
-target_base = 22
-```
-
-## Data Flow
-
-```text
-Communication Logs
-        │
-        ▼
-Campaign Eligibility
-        │
-        ▼
-Delivered Communications
-        │
-        ▼
-Campaign Lineage
-        │
-        ├───────────────┐
+Campaign Data + Communication Logs
+                │
+                ▼
+        Campaign Eligibility
+                │
+                ▼
+       Qualifying Communications
+                │
+                ▼
+        Campaign Lineage (CTE)
+                │
+        ┌───────┴───────┐
         ▼               ▼
-   Retry Chain      Standalone
+   Retry Chains      Standalone
         │               │
- DISTINCT Customer   Count Sends
+        ▼               ▼
+ Distinct Customers   Count Sends
         │               │
         └───────┬───────┘
                 ▼
-        Finance target_base
+        Reconciled Target Base
                 │
                 ▼
                22
 ```
+
+### Key SQL techniques
+
+* Common Table Expressions (CTEs)
+* Recursive CTEs
+* Conditional aggregation
+* `COUNT(DISTINCT ...)`
+* Self-referential campaign hierarchies
+* Date filtering
+* Business-rule-based filtering
+* Data reconciliation
+
+---
+
+## Results
+
+| Metric                              |  Value |
+| ----------------------------------- | -----: |
+| Initial count                       |     25 |
+| Excluded ineligible communications  |      4 |
+| Post-filter count                   |     21 |
+| Legitimate standalone communication |     +1 |
+| **Final target base**               | **22** |
+
+### Validation
+
+```text
+SQL result      = 22
+Finance target  = 22
+Variance        = 0
+```
+
+The final value is derived from the underlying data and business rules rather than hard-coded into the query.
+
+---
+
+## Why `COUNT(DISTINCT customer_id)` Alone Is Insufficient
+
+Consider two different scenarios.
+
+### Retry
+
+```text
+Campaign A
+   ↓
+Retry B
+   ↓
+Retry C
+
+Customer C20 → 3 delivered sends
+```
+
+These represent the same underlying communication and should be counted once.
+
+### Standalone campaign
+
+```text
+Campaign A
+
+Customer C20 → Send 1
+Customer C20 → Send 2
+```
+
+These can represent two legitimate communication events and should therefore be counted separately.
+
+The reconciliation logic uses campaign lineage to distinguish these cases.
+
+---
 
 ## Repository Structure
 
@@ -169,16 +183,15 @@ xeno-comm-log-reconciliation/
 └── README.md
 ```
 
-### File Description
+| File                | Description                                       |
+| ------------------- | ------------------------------------------------- |
+| `query.sql`         | Final reconciliation query                        |
+| `RECONCILIATION.md` | Detailed investigation and business-rule analysis |
+| `data/`             | Source data and SQLite database                   |
 
-| File                | Description                                        |
-| ------------------- | -------------------------------------------------- |
-| `query.sql`         | Final SQL reconciliation logic                     |
-| `RECONCILIATION.md` | Detailed investigation and reconciliation analysis |
-| `data/comm_log.db`  | SQLite database                                    |
-| `data/`             | Source datasets                                    |
+---
 
-## Running the Analysis
+## Reproducibility
 
 ### Requirements
 
@@ -204,48 +217,25 @@ Expected result:
 22
 ```
 
-## Validation
+---
 
-The result is validated against Finance's reported `target_base`:
+## Key Takeaway
 
-```text
-SQL result     = 22
-Finance target = 22
-Variance       = 0
-```
+The primary challenge was not calculating a count, but defining **what constitutes a unique communication event**.
 
-The target is not hard-coded into the query. The result is derived from the underlying campaign and communication data using the identified business rules.
+The final solution combines:
 
-## Key Analytical Insight
+**Campaign eligibility + campaign lineage + customer-level deduplication + standalone-send handling**
 
-The primary challenge was not the aggregation itself but defining what constitutes a **unique communication event**.
+to produce a reproducible Finance-aligned `target_base` of **22**.
 
-A simple:
+---
 
-```sql
-COUNT(DISTINCT customer_id)
-```
+## Skills
 
-can incorrectly merge legitimate repeated communications, while:
+**SQL · SQLite · Recursive CTEs · Data Reconciliation · Data Validation · Deduplication · Hierarchical Data · Business Rule Translation**
 
-```sql
-COUNT(*)
-```
+---
 
-can incorrectly count retries as separate events.
-
-The correct solution requires **campaign lineage + customer-level deduplication + campaign context**.
-
-## Skills Demonstrated
-
-* SQL
-* SQLite
-* Recursive CTEs
-* Data reconciliation
-* Data validation
-* Relational data analysis
-* Business-rule translation
-* Deduplication logic
-* Campaign lineage analysis
 
 [GitHub](https://github.com/vashurathour)
